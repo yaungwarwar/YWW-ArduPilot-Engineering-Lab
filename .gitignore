@@ -1,0 +1,35 @@
+# ArduPilot DataFlash and telemetry logs
+*.BIN
+*.bin
+*.tlog
+*.log
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Credentials
+.env
+.env.*
+*.pem
+*.key
+*.p12
+credentials.json
+secrets.json
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+
+# Operating system
+.DS_Store
+Thumbs.db
