@@ -11,10 +11,27 @@ function Time.__sub(a, b)
     return setmetatable({value = (a.value - b.value) % U32}, Time)
 end
 
+-- Production is loaded unchanged. Integration enables only the legacy monitor
+-- in memory; the deployable file and RETURN180 code are never rewritten.
+function Mock.source(path, configuration)
+    configuration = configuration or 'production'
+    assert(configuration == 'production' or configuration == 'integration',
+        'unknown test configuration: '..tostring(configuration))
+    local f = assert(io.open(path, 'r'))
+    local source = f:read('*a'); f:close()
+    if configuration == 'production' then return source end
+    local enabled, replacements = source:gsub('\nlocal MHR_ENABLED = false\n',
+        '\nlocal MHR_ENABLED = true\n')
+    assert(replacements == 1, 'expected exactly one production MHR_ENABLED = false declaration')
+    return enabled
+end
+
 function Mock.new(path, options)
     local opts = options or {}
     local h = {clock = opts.clock or 0, yaw = 311, armed = false,
-               notices = {}, records = {}, queue = {}, writes = {}, ids = {}}
+               configuration = opts.configuration or 'production',
+               notices = {}, records = {}, queue = {}, writes = {}, ids = {},
+               forbidden_calls = {}}
     local env = {assert=assert, error=error, ipairs=ipairs, pairs=pairs,
                  math=math, pcall=pcall, string=string, tostring=tostring,
                  tonumber=tonumber, type=type}
@@ -28,6 +45,7 @@ function Mock.new(path, options)
     end}
     env.arming = {is_armed = function()
         if h.arm_error then error('arming unavailable') end
+        if h.arm_missing then return nil end
         return h.armed
     end}
     env.ahrs = {get_yaw_rad = function()
@@ -36,7 +54,9 @@ function Mock.new(path, options)
         return math.rad(h.yaw)
     end}
     env.gcs = {send_text = function(_, severity, message)
-        if h.text_error and message:match('^YWW MagReturn') then
+        if (h.text_error and message:match('^YWW MagReturn')) or
+           (h.return180_text_error and (message:match('^YWW RETURN180 SIM') or
+                                        message:match('^YWW Telemetry LOST %(SIM%)'))) then
             error('injected STATUSTEXT exception')
         end
         h.notices[#h.notices+1] = {clock=h.clock, severity=severity, message=message}
@@ -45,9 +65,21 @@ function Mock.new(path, options)
         assert((name == 'YWHT' and labels == 'S,Ch,R,HB,SA,Rec,Lat,Flt,RR,N,Tx,Err'
                 and fmt == 'BBiiiBBIiiii') or
                (name == 'YWMR' and labels == 'Start,End,Turn,Err,Result,Dir'
-                and fmt == 'ffffBB'), 'unexpected DataFlash schema')
+                and fmt == 'ffffBB') or
+               (name == 'YWRT' and labels == 'Start,Target,End,Err,Result,Source,Dir'
+                and fmt == 'ffffBBB'), 'unexpected DataFlash schema')
         local values = {...}
         assert(#values == #fmt)
+        assert(#name<=4 and #labels<58 and #fmt<15)
+        local cols=1
+        for _ in labels:gmatch(',') do cols=cols+1 end
+        assert(cols==#fmt)
+        for i=1,#fmt do
+            assert(type(values[i])=='number')
+            if fmt:sub(i,i)=='B' then
+                assert(values[i]>=0 and values[i]<=255 and values[i]%1==0)
+            end
+        end
         h.writes[name] = (h.writes[name] or 0) + 1
         if h.log_error == name then error('injected logger exception') end
         h.records[#h.records+1] = {clock=h.clock, name=name, labels=labels,
@@ -64,7 +96,22 @@ function Mock.new(path, options)
             return item.msg, item.chan
         end,
     }
-    h.callback, h.delay = assert(loadfile(path, 't', env))()
+    -- A forbidden call remains visible even when production pcall catches it.
+    local function trap(api)
+        return {__index=function(_,method)
+            return function()
+                h.forbidden_calls[#h.forbidden_calls+1]=api..':'..method
+                error('forbidden API: '..api..':'..method)
+            end
+        end}
+    end
+    for _,api in ipairs({'param','arming','ahrs','mavlink','gcs','logger'}) do
+        setmetatable(env[api],trap(api))
+    end
+    for _,api in ipairs({'vehicle','SRV_Channels','motors','mission','rc'}) do
+        env[api]=setmetatable({},trap(api))
+    end
+    h.callback, h.delay = assert(load(Mock.source(path, h.configuration), '@'..path, 't', env))()
     assert(type(h.callback) == 'function' and h.delay == 100)
     setmetatable(h, {__index=Mock})
     return h

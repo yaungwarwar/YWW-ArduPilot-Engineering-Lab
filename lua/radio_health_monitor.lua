@@ -1,3 +1,4 @@
+-- YWW V5.3: read-only RETURN180 simulation; original V5.2 radio core below.
 -- YWW RF Health Monitor V5.2 (CUAV V5+ / ArduRover 4.7)
 -- READ ONLY. Bench diagnostic, NOT a flight failsafe.
 -- Subscribe to SiK RADIO_STATUS (109) and approved GCS HEARTBEAT (0).
@@ -225,7 +226,7 @@ end
 -- pcall once per existing update cycle, without altering the radio return.
 -- Requires ArduPilot scripting bindings: millis, ahrs, arming, gcs, logger.
 
-local MHR_ENABLED = true
+local MHR_ENABLED = false
 local MHR_START_STILL_MS = 2000
 local MHR_END_STILL_MS = 2000
 local MHR_RESTART_PAUSE_MS = 5000
@@ -389,6 +390,161 @@ local function report_magnetic_error(err)
     end
 end
 
+-- BEGIN V5.3 RETURN180 simulation
+-- No vehicle-control API is used. AHRS yaw is an estimate, not raw compass data.
+local R180_MAX_DURATION_MS, R180_SETTLE_MS = 120000, 2000
+local R180_MAX_GAP_MS, R180_MAX_STEP_DEG = 1000, 45
+local R180_MIN_TURN_DEG, R180_MAX_TURN_DEG = 170, 270
+local r180 = {
+    chan = nil, loss_latched = false, active = false,
+    start = 0, target = 0, turn = 0, source = 0,
+    prev = nil, prev_ms = nil, begin_ms = nil,
+    settle_ms = nil, settle_reference = nil, last_error_report = nil,
+}
+
+local function return180_diff(a, b)
+    return (a - b + 180) % 360 - 180
+end
+
+local function return180_heading()
+    local yaw = ahrs:get_yaw_rad()
+    if type(yaw) ~= 'number' or yaw ~= yaw or math.abs(yaw) > 1e6 then
+        return nil -- missing, NaN, infinity, or implausible yaw
+    end
+    return math.deg(yaw) % 360
+end
+
+local function return180_end(message)
+    -- Consume BEFORE telemetry calls; no retry on error or while loss persists.
+    r180.active = false
+    r180.settle_ms, r180.settle_reference = nil, nil
+    gcs:send_text(4, 'YWW RETURN180 SIM ' .. message)
+end
+
+local function return180_finish(yaw)
+    local err = return180_diff(yaw, r180.target)
+    local result, word, severity = 4, 'FAIL', 4
+    if math.abs(err) <= 2 then
+        result, word, severity = 2, 'PASS', 6
+    elseif math.abs(err) <= 5 then
+        result, word, severity = 3, 'WARN', 4
+    end
+    local direction = r180.turn >= 0 and 1 or 2
+    r180.active = false
+    r180.settle_ms, r180.settle_reference = nil, nil
+    -- Each I/O operation is attempted once, even if the other operation fails.
+    local log_ok, log_err = pcall(function()
+        logger:write('YWRT', 'Start,Target,End,Err,Result,Source,Dir', 'ffffBBB',
+            r180.start, r180.target, yaw, err, result, r180.source, direction)
+    end)
+    local text_ok, text_err = pcall(function()
+        gcs:send_text(severity, string.format(
+            'YWW RETURN180 SIM %s err=%+.2f', word, err))
+    end)
+    if not log_ok then error(log_err) end
+    if not text_ok then error(text_err) end
+end
+
+local function return180_update(radio_ok)
+    if not radio_ok then
+        if r180.active then return180_end('CANCEL radio error') end
+        return -- never qualify or trigger using a failed radio update
+    end
+    local now = millis()
+    if r180.chan ~= nil and radio_chan ~= r180.chan then
+        -- The existing radio monitor selects the channel. Never mix histories.
+        local pending = r180.active
+        r180.active, r180.chan, r180.loss_latched = false, nil, false
+        if pending then return180_end('CANCEL channel changed') end
+    end
+    local hb_age = radio_chan ~= nil and age_ms(now, gcs_seen[radio_chan]) or -1
+    local status_age = age_ms(now, last_radio)
+    local fresh = hb_age >= 0 and hb_age <= HB_TIMEOUT_MS and
+                  status_age >= 0 and status_age <= STATUS_TIMEOUT_MS
+    if fresh then
+        -- Cancel at first restoration, even before three-observation recovery.
+        local pending = r180.active
+        r180.active = false
+        if state == 'LINK_ACTIVE' then
+            r180.chan, r180.loss_latched = radio_chan, false
+        end
+        if pending then return180_end('CANCEL recovered') end
+        return
+    end
+    if r180.chan == nil then return end -- no prior LINK_ACTIVE: no experiment
+
+    if not r180.loss_latched then
+        local hb_lost = hb_age < 0 or hb_age > HB_TIMEOUT_MS
+        local status_lost = status_age < 0 or status_age > STATUS_TIMEOUT_MS
+        if not hb_lost and not status_lost then return end
+        r180.loss_latched = true -- one attempt, skip, or error per loss episode
+        -- Require an explicit disarmed indication; unknown state fails closed.
+        if arming:is_armed() ~= false then return180_end('SKIP armed'); return end
+        local yaw = return180_heading()
+        if yaw == nil then return180_end('SKIP invalid heading'); return end
+        r180.start, r180.target = yaw, (yaw + 180) % 360
+        r180.turn, r180.prev, r180.prev_ms, r180.begin_ms = 0, yaw, now, now
+        -- Source: 1 heartbeat timeout, 2 status stale, 3 both at trigger time.
+        r180.source = (hb_lost and 1 or 0) + (status_lost and 2 or 0)
+        r180.settle_ms, r180.settle_reference, r180.active = nil, nil, true
+        gcs:send_text(4, 'YWW Telemetry LOST (SIM)')
+        gcs:send_text(6, string.format('YWW RETURN180 SIM start=%.1f target=%.1f',
+            r180.start, r180.target))
+        -- FUTURE INTEGRATION POINT (COMMENT ONLY, NOT EXECUTABLE):
+        -- Any heading-control implementation would require a separate safety
+        -- design and independent review here. This experiment only observes
+        -- the operator's manual rotation; no control function is provided.
+        return
+    end
+    if not r180.active then return end
+    if arming:is_armed() ~= false then return180_end('CANCEL armed'); return end
+    local yaw = return180_heading()
+    if yaw == nil then return180_end('CANCEL invalid heading'); return end
+    local dt = age_ms(now, r180.prev_ms)
+    local delta = return180_diff(yaw, r180.prev)
+    if dt <= 0 or dt > R180_MAX_GAP_MS then
+        return180_end('CANCEL sample gap'); return
+    end
+    if math.abs(delta) > R180_MAX_STEP_DEG then
+        return180_end('CANCEL yaw jump'); return
+    end
+    if age_ms(now, r180.begin_ms) > R180_MAX_DURATION_MS then
+        return180_end('TIMEOUT'); return
+    end
+    r180.prev, r180.prev_ms, r180.turn = yaw, now, r180.turn + delta
+    local abs_turn = math.abs(r180.turn)
+    if abs_turn > R180_MAX_TURN_DEG then
+        return180_end('CANCEL excessive turn'); return
+    end
+    local candidate = abs_turn >= R180_MIN_TURN_DEG and abs_turn <= 190 and
+                      math.abs(return180_diff(yaw, r180.target)) <= 10
+    if candidate and math.abs(delta) <= 0.5 then
+        if not r180.settle_ms or
+           math.abs(return180_diff(yaw, r180.settle_reference)) > 1.5 then
+            r180.settle_ms, r180.settle_reference = now, yaw
+        elseif age_ms(now, r180.settle_ms) >= R180_SETTLE_MS then
+            return180_finish(yaw)
+        end
+    else
+        r180.settle_ms, r180.settle_reference = nil, nil
+    end
+end
+
+local function return180_error(err)
+    local pending = r180.active
+    r180.active, r180.loss_latched = false, true
+    if pending then
+        pcall(function() return180_end('CANCEL error') end)
+    end
+    local now = millis()
+    if not r180.last_error_report or age_ms(now, r180.last_error_report) >= 10000 then
+        r180.last_error_report = now
+        local message = tostring(err):gsub('^.-:%d+: ', '')
+        gcs:send_text(4, 'YWW RETURN180 SIM error: ' .. message:sub(1, 26))
+    end
+end
+-- END V5.3 RETURN180 simulation
+
 local function protected_update()
     local ok, err = pcall(step)
     if not ok then
@@ -404,6 +560,8 @@ local function protected_update()
         -- Protect diagnostics too: a telemetry failure must not stop the radio.
         pcall(report_magnetic_error, mhr_err)
     end
+    local rt_ok, rt_err = pcall(return180_update, ok)
+    if not rt_ok then pcall(return180_error, rt_err) end
     return protected_update, ok and 100 or 1000
 end
 

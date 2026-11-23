@@ -32,7 +32,9 @@ end
 function Trace.capture(h)
     local out = {}
     for _, n in ipairs(h.notices) do
-        if not n.message:match('^YWW MagReturn') then
+        if not n.message:match('^YWW MagReturn') and
+           not n.message:match('^YWW RETURN180 SIM') and
+           not n.message:match('^YWW Telemetry LOST %(SIM%)') then
             out[#out+1] = string.format('T|%d|%d|%s', n.clock, n.severity, n.message)
         end
     end
