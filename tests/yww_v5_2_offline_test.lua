@@ -16,6 +16,7 @@ Time.__index = Time
 function Time:toint()
     return self.value < 2147483648 and self.value or self.value - U32
 end
+function Time:tofloat() return self.value end
 function Time.__sub(a, b)
     return setmetatable({value = (a.value - b.value) % U32}, Time)
 end
@@ -24,6 +25,10 @@ function millis()
 end
 
 param = {}
+-- The radio regression suite supplies no usable heading; magnetic monitoring
+-- must remain idle while all original radio assertions run unchanged.
+arming = {is_armed = function() return false end}
+ahrs = {get_yaw_rad = function() return nil end}
 function param:get(key)
     if key == 'MAV_GCS_SYSID' then return 255 end
     if key == 'MAV_GCS_SYSID_HI' then return 0 end
@@ -48,6 +53,7 @@ function logger:write(name, labels, fmt, ...)
     for _ in labels:gmatch(',') do cols = cols + 1 end
     assert(cols == #fmt and #vals == #fmt, 'DataFlash format/argument mismatch')
     assert(fmt == 'BBiiiBBIiiii', 'Unexpected YWHT field types')
+    assert(labels == 'S,Ch,R,HB,SA,Rec,Lat,Flt,RR,N,Tx,Err', 'Unexpected YWHT labels')
     records[#records + 1] = {clock=clock, values=vals}
 end
 
